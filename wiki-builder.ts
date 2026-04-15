@@ -284,6 +284,10 @@ async function cmdCompile(): Promise<void> {
   console.log("\nPhase 3: Updating index...");
   await phaseIndex(client);
 
+  // Phase 4: Enrich summaries with links to concept articles (Haiku)
+  console.log("\nPhase 4: Enriching summaries with concept links...");
+  await phaseEnrichSummaries(client);
+
   const conceptCount = fs.readdirSync(CONCEPTS_DIR).filter((f) => f.endsWith(".md")).length;
   const summaryCount = fs.readdirSync(SUMMARIES_DIR).filter((f) => f.endsWith(".md")).length;
 
@@ -433,7 +437,7 @@ Return ONLY a JSON array, nothing else:
 
   const response = await client.messages.create({
     model: "claude-sonnet-4-6",
-    max_tokens: 8192,
+    max_tokens: 16000,
     system: systemPrompt,
     messages: [{ role: "user", content: contentBlocks }],
   });
@@ -507,6 +511,69 @@ Return a well-structured index.md in Ukrainian with:
 
   fs.writeFileSync(INDEX_FILE, (response.content[0] as Anthropic.TextBlock).text, "utf-8");
   console.log(`  → index.md`);
+}
+
+/**
+ * Enriches summaries by replacing plain concept names in "Ключові концепти"
+ * with markdown links to the actual concept files.
+ * Skips summaries that already contain links.
+ *
+ * @param client - Anthropic client instance
+ */
+async function phaseEnrichSummaries(client: Anthropic): Promise<void> {
+  const summaryFiles = fs
+    .readdirSync(SUMMARIES_DIR)
+    .filter((f) => f.endsWith(".md"))
+    .map((f) => path.join(SUMMARIES_DIR, f))
+    .sort();
+
+  if (summaryFiles.length === 0) return;
+
+  const conceptStems = fs
+    .readdirSync(CONCEPTS_DIR)
+    .filter((f) => f.endsWith(".md") && f !== "_raw_response.md")
+    .map((f) => path.basename(f, ".md"));
+
+  if (conceptStems.length === 0) return;
+
+  const conceptList = conceptStems.map((s) => `${s}.md`).join(", ");
+
+  for (const summaryPath of summaryFiles) {
+    const content = fs.readFileSync(summaryPath, "utf-8");
+
+    // Skip if links already present
+    if (content.includes("](../concepts/")) {
+      console.log(`  skip (already linked): ${path.basename(summaryPath)}`);
+      continue;
+    }
+
+    console.log(`  linking: ${path.basename(summaryPath)}`);
+
+    const response = await client.messages.create({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 1024,
+      messages: [
+        {
+          role: "user",
+          content: `You have this summary file:
+
+${content}
+
+Available concept files: ${conceptList}
+
+In the "## Ключові концепти" section, replace each plain concept name with a markdown link to the matching concept file using relative path "../concepts/filename.md".
+Only link concepts that have a clearly matching file. Keep the display text in Ukrainian as-is.
+Return the complete updated summary file content, nothing else.`,
+        },
+      ],
+    });
+
+    fs.writeFileSync(
+      summaryPath,
+      (response.content[0] as Anthropic.TextBlock).text,
+      "utf-8"
+    );
+  }
 }
 
 // ---------------------------------------------------------------------------
