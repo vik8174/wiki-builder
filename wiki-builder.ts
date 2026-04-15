@@ -10,6 +10,7 @@
 
 import fs from "fs";
 import path from "path";
+import { createHash } from "crypto";
 import { fileURLToPath } from "url";
 import Anthropic from "@anthropic-ai/sdk";
 import { Client as NotionClient } from "@notionhq/client";
@@ -32,7 +33,44 @@ const SUMMARIES_DIR = path.join(WIKI_DIR, "summaries");
 const CONCEPTS_DIR = path.join(WIKI_DIR, "concepts");
 const INDEX_FILE = path.join(WIKI_DIR, "index.md");
 
+const CONCEPT_INDEX_FILE = path.join(WIKI_DIR, "concept_index.json");
+
 const SUPPORTED_EXTENSIONS = new Set([".md", ".pdf"]);
+
+// ---------------------------------------------------------------------------
+// Concept index helpers
+// ---------------------------------------------------------------------------
+
+/**
+ * Tracks which articles map to which concepts, and stores content hashes
+ * to detect changes and enable incremental synthesis.
+ */
+interface ConceptIndex {
+  /** SHA256 of each summary file: article stem → hash */
+  articleHashes: Record<string, string>;
+  /** Concepts each article contributes to: article stem → concept slugs[] */
+  articleConcepts: Record<string, string[]>;
+  /** Articles belonging to each concept: concept slug → article stems[] */
+  conceptArticles: Record<string, string[]>;
+}
+
+/** Returns SHA256 hex digest of a string. */
+function hashContent(content: string): string {
+  return createHash("sha256").update(content).digest("hex");
+}
+
+/** Loads concept_index.json or returns an empty index if not present. */
+function loadConceptIndex(): ConceptIndex {
+  if (fs.existsSync(CONCEPT_INDEX_FILE)) {
+    return JSON.parse(fs.readFileSync(CONCEPT_INDEX_FILE, "utf-8")) as ConceptIndex;
+  }
+  return { articleHashes: {}, articleConcepts: {}, conceptArticles: {} };
+}
+
+/** Persists concept_index.json to disk. */
+function saveConceptIndex(index: ConceptIndex): void {
+  fs.writeFileSync(CONCEPT_INDEX_FILE, JSON.stringify(index, null, 2), "utf-8");
+}
 
 // ---------------------------------------------------------------------------
 // Notion helpers
@@ -367,8 +405,162 @@ async function phaseSummarize(client: Anthropic, rawFiles: string[]): Promise<vo
 }
 
 /**
- * Builds concept articles from all summaries using Sonnet with prompt caching.
- * Existing concepts are included as cached context to reduce costs on incremental runs.
+ * Map phase: for each changed summary, uses Haiku to extract concept slugs
+ * and updates the concept index. Returns changed article stems and affected concept slugs.
+ *
+ * @param client - Anthropic client instance
+ * @param summaryFiles - Absolute paths to all summary files
+ * @param index - Concept index (mutated in place)
+ */
+async function phaseMap(
+  client: Anthropic,
+  summaryFiles: string[],
+  index: ConceptIndex
+): Promise<{ changedStems: string[]; affectedConcepts: Set<string> }> {
+  const changedStems: string[] = [];
+  const affectedConcepts = new Set<string>();
+
+  // Existing slugs help Haiku reuse canonical names instead of creating duplicates
+  const existingSlugs = Object.keys(index.conceptArticles);
+
+  for (const summaryPath of summaryFiles) {
+    const stem = path.basename(summaryPath, ".md");
+    const content = fs.readFileSync(summaryPath, "utf-8");
+    const hash = hashContent(content);
+
+    if (index.articleHashes[stem] === hash) continue;
+
+    console.log(`  mapping: ${stem}`);
+    changedStems.push(stem);
+
+    const reuseHint =
+      existingSlugs.length > 0
+        ? `Existing concept slugs (reuse when relevant, don't create duplicates):\n${existingSlugs.join(", ")}\n\n`
+        : "";
+
+    const response = await client.messages.create({
+      model: "claude-haiku-4-5-20251001",
+      max_tokens: 256,
+      messages: [
+        {
+          role: "user",
+          content: `Extract 3-6 main concepts from this article summary.
+Return ONLY a JSON array of slug strings.
+${reuseHint}Rules: lowercase_underscores, English for tech terms, transliterated Ukrainian otherwise.
+Examples: ["react_native", "animatsii", "worklets", "headless_rezhym"]
+
+Summary:
+${content}`,
+        },
+      ],
+    });
+
+    let slugs: string[] = [];
+    const raw = (response.content[0] as Anthropic.TextBlock).text.trim();
+    try {
+      const start = raw.indexOf("[");
+      const end = raw.lastIndexOf("]");
+      if (start !== -1 && end !== -1) slugs = JSON.parse(raw.slice(start, end + 1));
+    } catch {
+      slugs = [stem.replace(/-/g, "_")];
+    }
+
+    // Mark old concepts of this article as affected (they may need updating)
+    for (const slug of index.articleConcepts[stem] ?? []) affectedConcepts.add(slug);
+    // Mark new concepts as affected
+    for (const slug of slugs) affectedConcepts.add(slug);
+
+    index.articleConcepts[stem] = slugs;
+    index.articleHashes[stem] = hash;
+  }
+
+  // Rebuild full conceptArticles map from scratch
+  index.conceptArticles = {};
+  for (const [articleStem, slugs] of Object.entries(index.articleConcepts)) {
+    for (const slug of slugs) {
+      (index.conceptArticles[slug] ??= []).push(articleStem);
+    }
+  }
+
+  return { changedStems, affectedConcepts };
+}
+
+/**
+ * Reduce phase: for each affected concept slug, synthesizes a focused concept
+ * article using only the relevant summaries. Each article is a separate Sonnet call,
+ * which removes the max_tokens ceiling and enables incremental updates.
+ *
+ * @param client - Anthropic client instance
+ * @param affectedConcepts - Set of concept slugs to (re)synthesize
+ * @param index - Concept index with article mappings
+ */
+async function phaseReduce(
+  client: Anthropic,
+  affectedConcepts: Set<string>,
+  index: ConceptIndex
+): Promise<void> {
+  for (const slug of affectedConcepts) {
+    const articleStems = index.conceptArticles[slug] ?? [];
+    if (articleStems.length === 0) continue;
+
+    const summaries = articleStems
+      .map((stem) => {
+        const p = path.join(SUMMARIES_DIR, `${stem}.md`);
+        return fs.existsSync(p) ? `### ${stem}\n\n${fs.readFileSync(p, "utf-8")}` : null;
+      })
+      .filter(Boolean)
+      .join("\n\n---\n\n");
+
+    if (!summaries) continue;
+
+    const conceptFilename = `${slug}.md`;
+    const conceptPath = path.join(CONCEPTS_DIR, conceptFilename);
+    const existing = fs.existsSync(conceptPath) ? fs.readFileSync(conceptPath, "utf-8") : "";
+
+    const contentBlocks: Anthropic.MessageParam["content"] = [];
+
+    if (existing) {
+      contentBlocks.push({
+        type: "text",
+        text: `## Existing concept article (update if needed):\n\n${existing}`,
+        cache_control: { type: "ephemeral" },
+      } as Anthropic.TextBlockParam & { cache_control: { type: "ephemeral" } });
+    }
+
+    contentBlocks.push({
+      type: "text",
+      text: `Write or update the concept article for "${slug.replace(/_/g, " ")}" in Ukrainian.
+
+Relevant article summaries:
+${summaries}
+
+Requirements:
+- Write entirely in Ukrainian
+- First paragraph: clear definition of the concept
+- Add backlinks to source articles: [article name](../summaries/stem.md)
+- Explain connections to related concepts
+- Return ONLY the markdown content, no JSON, no code fences`,
+    });
+
+    const response = await client.messages.create({
+      model: "claude-sonnet-4-6",
+      max_tokens: 2048,
+      messages: [{ role: "user", content: contentBlocks }],
+    });
+
+    fs.writeFileSync(
+      conceptPath,
+      (response.content[0] as Anthropic.TextBlock).text.trim(),
+      "utf-8"
+    );
+    console.log(`  → ${conceptFilename}`);
+  }
+}
+
+/**
+ * Orchestrates Map-Reduce synthesis of concept articles.
+ * Only processes summaries that have changed since the last compile,
+ * and re-synthesizes only the concepts affected by those changes.
  *
  * @param client - Anthropic client instance
  */
@@ -381,90 +573,19 @@ async function phaseSynthesize(client: Anthropic): Promise<void> {
 
   if (summaryFiles.length === 0) return;
 
-  const allSummaries = summaryFiles
-    .map((f) => {
-      const stem = path.basename(f, ".md");
-      return `### Файл: ${stem}\n\n${fs.readFileSync(f, "utf-8")}`;
-    })
-    .join("\n\n---\n\n");
+  const index = loadConceptIndex();
 
-  // Existing concepts become cached context — pay only for new summaries next run
-  let existingConcepts = "";
-  const conceptFiles = fs
-    .readdirSync(CONCEPTS_DIR)
-    .filter((f) => f.endsWith(".md"))
-    .map((f) => path.join(CONCEPTS_DIR, f))
-    .sort();
+  console.log("  Step 1/2: Mapping articles to concepts (Haiku)...");
+  const { changedStems, affectedConcepts } = await phaseMap(client, summaryFiles, index);
+  saveConceptIndex(index);
 
-  if (conceptFiles.length > 0) {
-    existingConcepts = conceptFiles
-      .map((f) => `<!-- ${path.basename(f, ".md")} -->\n${fs.readFileSync(f, "utf-8")}`)
-      .join("\n\n---\n\n");
+  if (changedStems.length === 0) {
+    console.log("  All concepts up to date — skipping synthesis.");
+    return;
   }
 
-  const systemPrompt = `You are a knowledge base curator. Your job is to maintain a wiki of concept articles.
-
-IMPORTANT: Write ALL content exclusively in Ukrainian. This includes titles, descriptions, explanations, and all text.
-
-Each concept article should:
-- Define the concept clearly in the first paragraph (in Ukrainian)
-- List related articles (by source filename) as backlinks
-- Explain how this concept connects to others
-- Use clear, concise markdown
-
-Return ONLY a JSON array, nothing else:
-[
-  {
-    "filename": "concept_name.md",
-    "content": "# Назва Концепту\\n\\nзміст українською..."
-  }
-]`;
-
-  const contentBlocks: Anthropic.MessageParam["content"] = [];
-
-  if (existingConcepts) {
-    contentBlocks.push({
-      type: "text",
-      text: `## Existing wiki concepts:\n\n${existingConcepts}`,
-      cache_control: { type: "ephemeral" },
-    } as Anthropic.TextBlockParam & { cache_control: { type: "ephemeral" } });
-  }
-
-  contentBlocks.push({
-    type: "text",
-    text: `## Article summaries:\n\n${allSummaries}\n\nCreate or update concept articles based on these summaries.\nAll content must be written in Ukrainian.\nGroup related articles under shared concepts.\nFilenames: lowercase with underscores, transliterated if needed (e.g. "mashynne_navchannia.md").`,
-  });
-
-  const response = await client.messages.create({
-    model: "claude-sonnet-4-6",
-    max_tokens: 16000,
-    system: systemPrompt,
-    messages: [{ role: "user", content: contentBlocks }],
-  });
-
-  let raw = (response.content[0] as Anthropic.TextBlock).text.trim();
-
-  // Extract JSON array — robust against leading text or code fences
-  const startIdx = raw.indexOf("[");
-  const endIdx = raw.lastIndexOf("]");
-  if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
-    raw = raw.slice(startIdx, endIdx + 1);
-  }
-
-  try {
-    const concepts = JSON.parse(raw) as Array<{ filename: string; content: string }>;
-    for (const concept of concepts) {
-      const filename = concept.filename?.trim();
-      const content = concept.content?.trim();
-      if (filename && content) {
-        fs.writeFileSync(path.join(CONCEPTS_DIR, filename), content, "utf-8");
-        console.log(`  → ${filename}`);
-      }
-    }
-  } catch (e) {
-    console.log(`  Warning: could not parse response: ${e}`);
-    fs.writeFileSync(path.join(CONCEPTS_DIR, "_raw_response.md"), raw, "utf-8");
-  }
+  console.log(`  Step 2/2: Synthesizing ${affectedConcepts.size} affected concepts (Sonnet)...`);
+  await phaseReduce(client, affectedConcepts, index);
 }
 
 /**
