@@ -3,3 +3,7 @@ node_modules/
 raw/
 wiki/
 state.json
+.obsidian/
+Untitled.base
+tsx
+wiki-builder@1.0.0
