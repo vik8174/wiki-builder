@@ -310,10 +310,7 @@ Return exactly this format:
 ## Ключові концепти
 - концепт 1
 - концепт 2
-- концепт 3
-
-## Джерело
-${stem}`;
+- концепт 3`;
 
   if (path.extname(rawPath).toLowerCase() === ".pdf") {
     const pdfData = fs.readFileSync(rawPath).toString("base64");
@@ -381,7 +378,10 @@ async function phaseSynthesize(client: Anthropic): Promise<void> {
   if (summaryFiles.length === 0) return;
 
   const allSummaries = summaryFiles
-    .map((f) => fs.readFileSync(f, "utf-8"))
+    .map((f) => {
+      const stem = path.basename(f, ".md");
+      return `### Файл: ${stem}\n\n${fs.readFileSync(f, "utf-8")}`;
+    })
     .join("\n\n---\n\n");
 
   // Existing concepts become cached context — pay only for new summaries next run
