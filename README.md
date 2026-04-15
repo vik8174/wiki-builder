@@ -6,26 +6,27 @@ Transform your articles into an organized knowledge base using Claude.
 
 ```bash
 # 1. Install dependencies
-python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+npm install
 
 # 2. Configure
 cp .env.example .env
 # Add your ANTHROPIC_API_KEY to .env
 
 # 3. Add an article and build
-.venv/bin/python wiki_builder.py compile
+npm run compile
 ```
 
 ## Tech Stack
 
-- Python 3
+- Node.js 22 + TypeScript
+- [tsx](https://github.com/privatenumber/tsx) — run TypeScript without compilation
 - [Anthropic SDK](https://github.com/anthropics/anthropic-sdk-python) — Claude API with prompt caching
 - [Notion Client](https://github.com/ramnes/notion-sdk-py) — fetch pages from Notion
-- [python-dotenv](https://github.com/theskumar/python-dotenv) — environment variables
+- [dotenv](https://github.com/motdotla/dotenv) — environment variables
 
 ## Prerequisites
 
-- Python 3.10+
+- Node.js 22+
 - Anthropic API key — [console.anthropic.com](https://console.anthropic.com)
 - Notion integration token *(optional, for `add` command)* — [notion.so/my-integrations](https://www.notion.so/my-integrations)
 
@@ -44,9 +45,9 @@ NOTION_TOKEN=secret_...
 
 | Command | Description |
 |---------|-------------|
-| `python wiki_builder.py add <url>` | Fetch a Notion page, save to `raw/`, compile |
-| `python wiki_builder.py compile` | Process all files in `raw/` → build `wiki/` |
-| `python wiki_builder.py query "question"` | Ask a question against the wiki |
+| `npm run add -- <url>` | Fetch a Notion page, save to `raw/`, compile |
+| `npm run compile` | Process all files in `raw/` → build `wiki/` |
+| `npm run query -- "question"` | Ask a question against the wiki |
 
 ## Project Structure
 
@@ -57,7 +58,7 @@ wiki/
 │   ├── index.md       # Auto-generated master index
 │   ├── concepts/      # Concept articles (written by Claude)
 │   └── summaries/     # Per-article summaries (written by Claude)
-├── wiki_builder.py    # Main script
+├── wiki-builder.ts    # Main script
 ├── CONVENTIONS.md     # File naming rules for raw/
 └── .env               # API keys (not committed)
 ```
