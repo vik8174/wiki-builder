@@ -59,7 +59,6 @@ wiki/
 │   ├── concepts/      # Concept articles (written by Claude)
 │   └── summaries/     # Per-article summaries (written by Claude)
 ├── wiki-builder.ts    # Main script
-├── CONVENTIONS.md     # File naming rules for raw/
 └── .env               # API keys (not committed)
 ```
 
