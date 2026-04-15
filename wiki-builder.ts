@@ -1,6 +1,6 @@
 #!/usr/bin/env tsx
 /**
- * Wiki Builder — transforms .md and .pdf articles in raw/ into an organized wiki using Claude.
+ * Wiki Builder — transforms Notion articles into an organized wiki using Claude.
  *
  * Usage:
  *   npm run add -- <notion-url>   # fetch from Notion, save to raw/, compile
@@ -34,8 +34,6 @@ const CONCEPTS_DIR = path.join(WIKI_DIR, "concepts");
 const INDEX_FILE = path.join(WIKI_DIR, "index.md");
 
 const CONCEPT_INDEX_FILE = path.join(WIKI_DIR, "concept_index.json");
-
-const SUPPORTED_EXTENSIONS = new Set([".md", ".pdf"]);
 
 // ---------------------------------------------------------------------------
 // Concept index helpers
@@ -284,26 +282,24 @@ async function cmdCompile(): Promise<void> {
   }
 
   if (!fs.existsSync(RAW_DIR)) {
-    console.log(`No .md or .pdf files found in raw/`);
-    console.log("Add some articles to raw/ and run compile again.");
+    console.log("No .md files found in raw/");
+    console.log("Add articles via: npm run add -- <notion-url>");
     return;
   }
 
   const rawFiles = fs
     .readdirSync(RAW_DIR)
-    .filter((f) => SUPPORTED_EXTENSIONS.has(path.extname(f).toLowerCase()))
+    .filter((f) => f.endsWith(".md"))
     .map((f) => path.join(RAW_DIR, f))
     .sort();
 
   if (rawFiles.length === 0) {
-    console.log(`No .md or .pdf files found in raw/`);
-    console.log("Add some articles to raw/ and run compile again.");
+    console.log("No .md files found in raw/");
+    console.log("Add articles via: npm run add -- <notion-url>");
     return;
   }
 
-  const mdCount = rawFiles.filter((f) => path.extname(f).toLowerCase() === ".md").length;
-  const pdfCount = rawFiles.filter((f) => path.extname(f).toLowerCase() === ".pdf").length;
-  console.log(`Found ${rawFiles.length} articles in raw/ (${mdCount} md, ${pdfCount} pdf)`);
+  console.log(`Found ${rawFiles.length} articles in raw/`);
 
   fs.mkdirSync(SUMMARIES_DIR, { recursive: true });
   fs.mkdirSync(CONCEPTS_DIR, { recursive: true });
@@ -336,13 +332,12 @@ async function cmdCompile(): Promise<void> {
 }
 
 /**
- * Builds the message content blocks for a single file (.md or .pdf).
+ * Builds the message content for summarizing a single .md file.
  *
- * @param rawPath - Absolute path to the source file
- * @returns Array of Anthropic message content blocks
+ * @param rawPath - Absolute path to the source .md file
+ * @returns Anthropic message content blocks
  */
 function buildSummarizeContent(rawPath: string): Anthropic.MessageParam["content"] {
-  const stem = path.basename(rawPath, path.extname(rawPath));
   const prompt = `Summarize this article. Write everything in Ukrainian.
 
 Return exactly this format:
@@ -354,22 +349,6 @@ Return exactly this format:
 - концепт 2
 - концепт 3`;
 
-  if (path.extname(rawPath).toLowerCase() === ".pdf") {
-    const pdfData = fs.readFileSync(rawPath).toString("base64");
-    return [
-      {
-        type: "document",
-        source: {
-          type: "base64",
-          media_type: "application/pdf",
-          data: pdfData,
-        },
-      } as Anthropic.Base64PDFBlock,
-      { type: "text", text: prompt },
-    ];
-  }
-
-  // .md — plain text
   return [{ type: "text", text: fs.readFileSync(rawPath, "utf-8") + "\n\n" + prompt }];
 }
 
@@ -797,7 +776,7 @@ async function main(): Promise<void> {
 
 Usage:
   npm run add -- <notion-url>   Fetch a Notion page, save to raw/, compile
-  npm run compile               Process raw/*.md and raw/*.pdf → wiki/
+  npm run compile               Process raw/*.md → wiki/
   npm run query -- "question"   Ask a question against the wiki`);
   }
 }

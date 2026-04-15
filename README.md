@@ -1,6 +1,6 @@
 # Wiki Builder
 
-Transform your articles into an organized knowledge base using Claude.
+Transform your Notion articles into an organized knowledge base using Claude.
 
 ## Quick Start
 
@@ -10,10 +10,10 @@ npm install
 
 # 2. Configure
 cp .env.example .env
-# Add your ANTHROPIC_API_KEY to .env
+# Add ANTHROPIC_API_KEY and NOTION_TOKEN to .env
 
-# 3. Add an article and build
-npm run compile
+# 3. Add a Notion article and build
+npm run add -- <notion-url>
 ```
 
 ## Tech Stack
@@ -28,7 +28,7 @@ npm run compile
 
 - Node.js 22+
 - Anthropic API key — [console.anthropic.com](https://console.anthropic.com)
-- Notion integration token *(optional, for `add` command)* — [notion.so/my-integrations](https://www.notion.so/my-integrations)
+- Notion integration token — [notion.so/my-integrations](https://www.notion.so/my-integrations)
 
 ## Configuration
 
@@ -36,8 +36,6 @@ Copy `.env.example` to `.env` and fill in:
 
 ```
 ANTHROPIC_API_KEY=sk-ant-...
-
-# Optional — required only for the `add` command
 NOTION_TOKEN=secret_...
 ```
 
@@ -53,7 +51,7 @@ NOTION_TOKEN=secret_...
 
 ```
 wiki/
-├── raw/               # Source articles (.md and .pdf)
+├── raw/               # Source articles fetched from Notion
 ├── wiki/
 │   ├── index.md       # Auto-generated master index
 │   ├── concepts/      # Concept articles (written by Claude)
@@ -64,9 +62,9 @@ wiki/
 
 ## How It Works
 
-1. **Add** — drop `.md` or `.pdf` files into `raw/`, or use `add` to fetch from Notion
+1. **Add** — fetch a Notion page with `add`, saved to `raw/` as markdown
 2. **Summarize** — Claude Haiku summarizes each article individually
 3. **Synthesize** — Claude Sonnet groups summaries into concept articles with backlinks
 4. **Index** — Claude Haiku builds a master index grouped by theme
 
-Prompt caching keeps incremental runs cheap — only new articles are processed each time.
+Prompt caching keeps incremental runs cheap — only new or changed articles are processed each time.
