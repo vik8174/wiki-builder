@@ -440,12 +440,11 @@ Return ONLY a JSON array, nothing else:
 
   let raw = (response.content[0] as Anthropic.TextBlock).text.trim();
 
-  // Strip markdown code fences if present
-  if (raw.startsWith("```")) {
-    const lines = raw.split("\n");
-    raw = lines.slice(1).join("\n");
-    const fenceIdx = raw.lastIndexOf("```");
-    if (fenceIdx !== -1) raw = raw.slice(0, fenceIdx);
+  // Extract JSON array — robust against leading text or code fences
+  const startIdx = raw.indexOf("[");
+  const endIdx = raw.lastIndexOf("]");
+  if (startIdx !== -1 && endIdx !== -1 && endIdx > startIdx) {
+    raw = raw.slice(startIdx, endIdx + 1);
   }
 
   try {
