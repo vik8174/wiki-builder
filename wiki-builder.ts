@@ -1,18 +1,20 @@
 #!/usr/bin/env tsx
 /**
- * Wiki Builder — transforms Notion articles into an organized wiki using Claude.
+ * Wiki Builder — transforms Notion articles into an organized wiki using Claude CLI.
  *
  * Usage:
- *   npm run add -- <notion-url>   # fetch from Notion, save to raw/, compile
- *   npm run compile               # build wiki from raw/
- *   npm run query -- "question"   # ask a question against the wiki
+ *   npm run add -- <notion-url>                 # fetch from Notion, save to raw/, compile
+ *   cat file.txt | npm run paste -- "Title"     # process raw text, translate, add to wiki
+ *   npm run compile                             # build wiki from raw/
+ *   npm run query -- "question"                 # ask a question against the wiki
+ *   npm run linkedin                            # generate 10 LinkedIn post ideas from wiki
  */
 
 import fs from "fs";
 import path from "path";
 import { createHash } from "crypto";
 import { fileURLToPath } from "url";
-import Anthropic from "@anthropic-ai/sdk";
+import { spawn } from "child_process";
 import { Client as NotionClient } from "@notionhq/client";
 import type {
   BlockObjectResponse,
@@ -32,8 +34,65 @@ const WIKI_DIR = path.join(BASE_DIR, "wiki");
 const SUMMARIES_DIR = path.join(WIKI_DIR, "summaries");
 const CONCEPTS_DIR = path.join(WIKI_DIR, "concepts");
 const INDEX_FILE = path.join(WIKI_DIR, "index.md");
-
 const CONCEPT_INDEX_FILE = path.join(WIKI_DIR, "concept_index.json");
+
+// ---------------------------------------------------------------------------
+// Claude CLI helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Calls `claude -p <prompt>` as a subprocess and returns its stdout.
+ * Uses the active Claude Code session — no API key required.
+ *
+ * @param prompt - Full prompt to send to Claude
+ * @returns Claude's response as a string
+ */
+function callClaude(prompt: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    const proc = spawn("claude", ["-p", prompt], {
+      stdio: ["ignore", "pipe", "pipe"],
+    });
+    let out = "";
+    let err = "";
+    proc.stdout.on("data", (d: Buffer) => (out += d.toString()));
+    proc.stderr.on("data", (d: Buffer) => (err += d.toString()));
+    proc.on("error", reject);
+    proc.on("close", (code: number | null) => {
+      if (code === 0) {
+        resolve(out.trim());
+      } else {
+        reject(new Error(`claude exited ${code}: ${err.slice(0, 200)}`));
+      }
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
+// Concurrency helper
+// ---------------------------------------------------------------------------
+
+/**
+ * Runs async tasks over an array with a bounded concurrency pool.
+ * Replaces sequential for-loops to scale to 1000+ articles.
+ *
+ * @param items - Items to process
+ * @param fn - Async function to run for each item
+ * @param limit - Max concurrent workers (default: 5)
+ */
+async function runConcurrent<T>(
+  items: T[],
+  fn: (item: T) => Promise<void>,
+  limit = 5
+): Promise<void> {
+  const queue = [...items];
+  const worker = async (): Promise<void> => {
+    while (queue.length) {
+      const item = queue.shift()!;
+      await fn(item);
+    }
+  };
+  await Promise.all(Array.from({ length: Math.min(limit, items.length) }, worker));
+}
 
 // ---------------------------------------------------------------------------
 // Concept index helpers
@@ -140,8 +199,7 @@ function blocksToMarkdown(blocks: BlockObjectResponse[]): string {
       case "image":
       case "video":
       case "file": {
-        const url: string =
-          (data.external?.url ?? data.file?.url ?? "");
+        const url: string = data.external?.url ?? data.file?.url ?? "";
         const caption: string = (data.caption as RichTextItemResponse[] ?? [])
           .map((t) => t.plain_text)
           .join("");
@@ -169,12 +227,10 @@ async function fetchNotionPage(pageId: string): Promise<string> {
 
   const notion = new NotionClient({ auth: notionToken });
 
-  // Fetch page metadata
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const page = (await notion.pages.retrieve({ page_id: pageId })) as any;
   const props = page.properties ?? {};
 
-  // Title
   const titleProp = Object.values(props).find(
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     (p: any) => p.type === "title"
@@ -184,7 +240,6 @@ async function fetchNotionPage(pageId: string): Promise<string> {
     .map((t: RichTextItemResponse) => t.plain_text)
     .join("");
 
-  // Tags
   let tags: string[] = [];
   for (const prop of Object.values(props) as any[]) {
     if (prop.type === "multi_select") {
@@ -193,7 +248,6 @@ async function fetchNotionPage(pageId: string): Promise<string> {
     }
   }
 
-  // Category
   let category = "";
   for (const prop of Object.values(props) as any[]) {
     if (prop.type === "select" && prop.select) {
@@ -202,7 +256,6 @@ async function fetchNotionPage(pageId: string): Promise<string> {
     }
   }
 
-  // Blocks (paginated)
   const blocks: BlockObjectResponse[] = [];
   let cursor: string | undefined;
   while (true) {
@@ -216,7 +269,6 @@ async function fetchNotionPage(pageId: string): Promise<string> {
   }
 
   const body = blocksToMarkdown(blocks);
-
   const header = [`# ${title}`];
   if (category) header.push(`**Category:** ${category}`);
   if (tags.length) header.push(`**Tags:** ${tags.join(", ")}`);
@@ -236,7 +288,7 @@ function titleToFilename(title: string): string {
   slug = slug.replace(/[^\w\s-]/g, "");
   slug = slug.replace(/[\s_]+/g, "-");
   slug = slug.replace(/-+/g, "-").replace(/^-|-$/g, "");
-  return slug || "notion-page";
+  return slug || "article";
 }
 
 // ---------------------------------------------------------------------------
@@ -254,7 +306,6 @@ async function cmdAdd(url: string): Promise<void> {
   const pageId = extractPageId(url);
   const content = await fetchNotionPage(pageId);
 
-  // Derive filename from title (first line: "# Title")
   const firstLine = content.split("\n")[0].replace(/^#\s*/, "").trim();
   const filename = titleToFilename(firstLine) + ".md";
   const rawPath = path.join(RAW_DIR, filename);
@@ -268,19 +319,73 @@ async function cmdAdd(url: string): Promise<void> {
 }
 
 // ---------------------------------------------------------------------------
+// paste command
+// ---------------------------------------------------------------------------
+
+/** Reads all stdin until EOF and returns as a string. */
+async function readStdin(): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of process.stdin) chunks.push(chunk as Buffer);
+  return Buffer.concat(chunks).toString("utf-8").trim();
+}
+
+/**
+ * Reads raw text from stdin, translates it to Ukrainian if needed,
+ * saves to raw/, then compiles the wiki.
+ *
+ * @param title - Article title (used as filename slug)
+ */
+async function cmdPaste(title: string): Promise<void> {
+  const rawContent = await readStdin();
+
+  if (!rawContent) {
+    console.error("Error: no content piped via stdin");
+    console.error('Usage: cat file.txt | npm run paste -- "Article Title"');
+    process.exit(1);
+  }
+
+  const slug = titleToFilename(title);
+  if (slug === "article") {
+    console.warn(`Warning: title "${title}" produced a generic slug. Consider a more descriptive title.`);
+  }
+  const filename = `${slug}.md`;
+  const rawPath = path.join(RAW_DIR, filename);
+
+  console.log(`Processing: "${title}"`);
+
+  const result = await callClaude(
+    `You received an article in any language. Prepare it for a Ukrainian knowledge wiki.
+
+Tasks:
+1. If the article is not in Ukrainian — translate it fully to Ukrainian (keep technical terms in English where natural)
+2. Preserve all substance — do not summarize, translate the complete content
+3. Format as markdown with this header:
+   # ${title}
+
+   [full article content in Ukrainian]
+
+Return ONLY the formatted markdown article, nothing else.
+
+Article:
+${rawContent}`
+  );
+
+  fs.mkdirSync(RAW_DIR, { recursive: true });
+  fs.writeFileSync(rawPath, result, "utf-8");
+  console.log(`Saved: raw/${filename}`);
+  console.log();
+
+  await cmdCompile();
+}
+
+// ---------------------------------------------------------------------------
 // compile command
 // ---------------------------------------------------------------------------
 
 /**
- * Builds wiki/ from raw/ using Claude.
+ * Builds wiki/ from raw/ using Claude CLI.
  */
 async function cmdCompile(): Promise<void> {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    console.error("Error: ANTHROPIC_API_KEY must be set in .env");
-    process.exit(1);
-  }
-
   if (!fs.existsSync(RAW_DIR)) {
     console.log("No .md files found in raw/");
     console.log("Add articles via: npm run add -- <notion-url>");
@@ -304,23 +409,17 @@ async function cmdCompile(): Promise<void> {
   fs.mkdirSync(SUMMARIES_DIR, { recursive: true });
   fs.mkdirSync(CONCEPTS_DIR, { recursive: true });
 
-  const client = new Anthropic({ apiKey });
-
-  // Phase 1: Summarize each article (Haiku, cheap, one by one)
   console.log("\nPhase 1: Summarizing articles...");
-  await phaseSummarize(client, rawFiles);
+  await phaseSummarize(rawFiles);
 
-  // Phase 2: Build concept articles (Sonnet + prompt caching)
   console.log("\nPhase 2: Building concept articles...");
-  await phaseSynthesize(client);
+  await phaseSynthesize();
 
-  // Phase 3: Update index (Haiku)
   console.log("\nPhase 3: Updating index...");
-  await phaseIndex(client);
+  await phaseIndex();
 
-  // Phase 4: Enrich summaries with links to concept articles (Haiku)
   console.log("\nPhase 4: Enriching summaries with concept links...");
-  await phaseEnrichSummaries(client);
+  await phaseEnrichSummaries();
 
   const conceptCount = fs.readdirSync(CONCEPTS_DIR).filter((f) => f.endsWith(".md")).length;
   const summaryCount = fs.readdirSync(SUMMARIES_DIR).filter((f) => f.endsWith(".md")).length;
@@ -332,13 +431,29 @@ async function cmdCompile(): Promise<void> {
 }
 
 /**
- * Builds the message content for summarizing a single .md file.
+ * Summarizes each raw article in parallel (up to 5 concurrent).
+ * Skips files whose summary is already up to date.
  *
- * @param rawPath - Absolute path to the source .md file
- * @returns Anthropic message content blocks
+ * @param rawFiles - Absolute paths to raw .md files
  */
-function buildSummarizeContent(rawPath: string): Anthropic.MessageParam["content"] {
-  const prompt = `Summarize this article. Write everything in Ukrainian.
+async function phaseSummarize(rawFiles: string[]): Promise<void> {
+  await runConcurrent(rawFiles, async (rawPath) => {
+    const stem = path.basename(rawPath, ".md");
+    const summaryPath = path.join(SUMMARIES_DIR, `${stem}.md`);
+
+    if (
+      fs.existsSync(summaryPath) &&
+      fs.statSync(summaryPath).mtimeMs >= fs.statSync(rawPath).mtimeMs
+    ) {
+      console.log(`  skip (up to date): ${path.basename(rawPath)}`);
+      return;
+    }
+
+    console.log(`  summarizing: ${path.basename(rawPath)}`);
+
+    const content = fs.readFileSync(rawPath, "utf-8");
+    const result = await callClaude(
+      `Summarize this article. Write everything in Ukrainian.
 
 Return exactly this format:
 ## Підсумок
@@ -347,113 +462,84 @@ Return exactly this format:
 ## Ключові концепти
 - концепт 1
 - концепт 2
-- концепт 3`;
+- концепт 3
 
-  return [{ type: "text", text: fs.readFileSync(rawPath, "utf-8") + "\n\n" + prompt }];
+## Джерело
+${stem}
+
+Article:
+${content}`
+    );
+
+    fs.writeFileSync(summaryPath, result, "utf-8");
+  });
 }
 
 /**
- * Summarizes each article in raw/. Skips files whose summary is already up to date.
+ * Map phase: extracts concept slugs from changed summaries in parallel.
+ * Writes results to the concept index atomically after all workers finish.
  *
- * @param client - Anthropic client instance
- * @param rawFiles - Array of absolute paths to source files
- */
-async function phaseSummarize(client: Anthropic, rawFiles: string[]): Promise<void> {
-  for (const rawPath of rawFiles) {
-    const stem = path.basename(rawPath, path.extname(rawPath));
-    const summaryPath = path.join(SUMMARIES_DIR, `${stem}.md`);
-
-    if (
-      fs.existsSync(summaryPath) &&
-      fs.statSync(summaryPath).mtimeMs >= fs.statSync(rawPath).mtimeMs
-    ) {
-      console.log(`  skip (up to date): ${path.basename(rawPath)}`);
-      continue;
-    }
-
-    console.log(`  summarizing: ${path.basename(rawPath)}`);
-
-    const response = await client.messages.create({
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: 512,
-      messages: [{ role: "user", content: buildSummarizeContent(rawPath) }],
-    });
-
-    fs.writeFileSync(summaryPath, (response.content[0] as Anthropic.TextBlock).text, "utf-8");
-  }
-}
-
-/**
- * Map phase: for each changed summary, uses Haiku to extract concept slugs
- * and updates the concept index. Returns changed article stems and affected concept slugs.
- *
- * @param client - Anthropic client instance
  * @param summaryFiles - Absolute paths to all summary files
- * @param index - Concept index (mutated in place)
+ * @param index - Concept index (mutated in place after all workers complete)
  */
 async function phaseMap(
-  client: Anthropic,
   summaryFiles: string[],
   index: ConceptIndex
 ): Promise<{ changedStems: string[]; affectedConcepts: Set<string> }> {
   const changedStems: string[] = [];
   const affectedConcepts = new Set<string>();
 
-  // Existing slugs help Haiku reuse canonical names instead of creating duplicates
+  // Snapshot existing slugs before any worker modifies the index
   const existingSlugs = Object.keys(index.conceptArticles);
 
+  // Identify changed files and cache their content upfront (single read per file)
+  const changedFiles: Array<{ summaryPath: string; content: string; hash: string }> = [];
   for (const summaryPath of summaryFiles) {
     const stem = path.basename(summaryPath, ".md");
     const content = fs.readFileSync(summaryPath, "utf-8");
     const hash = hashContent(content);
+    if (index.articleHashes[stem] !== hash) changedFiles.push({ summaryPath, content, hash });
+  }
 
-    if (index.articleHashes[stem] === hash) continue;
+  await runConcurrent(changedFiles, async ({ summaryPath, content, hash }) => {
+    const stem = path.basename(summaryPath, ".md");
 
     console.log(`  mapping: ${stem}`);
-    changedStems.push(stem);
 
     const reuseHint =
       existingSlugs.length > 0
         ? `Existing concept slugs (reuse when relevant, don't create duplicates):\n${existingSlugs.join(", ")}\n\n`
         : "";
 
-    const response = await client.messages.create({
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: 256,
-      messages: [
-        {
-          role: "user",
-          content: `Extract 3-6 main concepts from this article summary.
+    const raw = await callClaude(
+      `Extract 3-6 main concepts from this article summary.
 Return ONLY a JSON array of slug strings.
 ${reuseHint}Rules: lowercase_underscores, English for tech terms, transliterated Ukrainian otherwise.
 Examples: ["react_native", "animatsii", "worklets", "headless_rezhym"]
 
 Summary:
-${content}`,
-        },
-      ],
-    });
+${content}`
+    );
 
     let slugs: string[] = [];
-    const raw = (response.content[0] as Anthropic.TextBlock).text.trim();
     try {
       const start = raw.indexOf("[");
       const end = raw.lastIndexOf("]");
       if (start !== -1 && end !== -1) slugs = JSON.parse(raw.slice(start, end + 1));
     } catch {
+      console.warn(`  warn: failed to parse slugs for ${stem}, using fallback`);
       slugs = [stem.replace(/-/g, "_")];
     }
 
-    // Mark old concepts of this article as affected (they may need updating)
+    // Safe in Node.js async — JS event loop is single-threaded between awaits
+    changedStems.push(stem);
     for (const slug of index.articleConcepts[stem] ?? []) affectedConcepts.add(slug);
-    // Mark new concepts as affected
     for (const slug of slugs) affectedConcepts.add(slug);
-
     index.articleConcepts[stem] = slugs;
     index.articleHashes[stem] = hash;
-  }
+  });
 
-  // Rebuild full conceptArticles map from scratch
+  // Rebuild conceptArticles after all workers have written to articleConcepts
   index.conceptArticles = {};
   for (const [articleStem, slugs] of Object.entries(index.articleConcepts)) {
     for (const slug of slugs) {
@@ -465,22 +551,19 @@ ${content}`,
 }
 
 /**
- * Reduce phase: for each affected concept slug, synthesizes a focused concept
- * article using only the relevant summaries. Each article is a separate Sonnet call,
- * which removes the max_tokens ceiling and enables incremental updates.
+ * Reduce phase: synthesizes a focused concept article for each affected concept
+ * in parallel (up to 5 concurrent). Each concept is an independent Claude call.
  *
- * @param client - Anthropic client instance
- * @param affectedConcepts - Set of concept slugs to (re)synthesize
+ * @param affectedConcepts - Concept slugs to (re)synthesize
  * @param index - Concept index with article mappings
  */
 async function phaseReduce(
-  client: Anthropic,
   affectedConcepts: Set<string>,
   index: ConceptIndex
 ): Promise<void> {
-  for (const slug of affectedConcepts) {
+  await runConcurrent([...affectedConcepts], async (slug) => {
     const articleStems = index.conceptArticles[slug] ?? [];
-    if (articleStems.length === 0) continue;
+    if (articleStems.length === 0) return;
 
     const summaries = articleStems
       .map((stem) => {
@@ -490,25 +573,18 @@ async function phaseReduce(
       .filter(Boolean)
       .join("\n\n---\n\n");
 
-    if (!summaries) continue;
+    if (!summaries) return;
 
     const conceptFilename = `${slug}.md`;
     const conceptPath = path.join(CONCEPTS_DIR, conceptFilename);
     const existing = fs.existsSync(conceptPath) ? fs.readFileSync(conceptPath, "utf-8") : "";
 
-    const contentBlocks: Anthropic.MessageParam["content"] = [];
+    const existingSection = existing
+      ? `## Existing concept article (update if needed):\n\n${existing}\n\n---\n\n`
+      : "";
 
-    if (existing) {
-      contentBlocks.push({
-        type: "text",
-        text: `## Existing concept article (update if needed):\n\n${existing}`,
-        cache_control: { type: "ephemeral" },
-      } as Anthropic.TextBlockParam & { cache_control: { type: "ephemeral" } });
-    }
-
-    contentBlocks.push({
-      type: "text",
-      text: `Write or update the concept article for "${slug.replace(/_/g, " ")}" in Ukrainian.
+    const result = await callClaude(
+      `${existingSection}Write or update the concept article for "${slug.replace(/_/g, " ")}" in Ukrainian.
 
 Relevant article summaries:
 ${summaries}
@@ -518,32 +594,19 @@ Requirements:
 - First paragraph: clear definition of the concept
 - Add backlinks to source articles: [article name](../summaries/stem.md)
 - Explain connections to related concepts
-- Return ONLY the markdown content, no JSON, no code fences`,
-    });
-
-    const response = await client.messages.create({
-      model: "claude-sonnet-4-6",
-      max_tokens: 2048,
-      messages: [{ role: "user", content: contentBlocks }],
-    });
-
-    fs.writeFileSync(
-      conceptPath,
-      (response.content[0] as Anthropic.TextBlock).text.trim(),
-      "utf-8"
+- Return ONLY the markdown content, no JSON, no code fences`
     );
+
+    fs.writeFileSync(conceptPath, result.trim(), "utf-8");
     console.log(`  → ${conceptFilename}`);
-  }
+  });
 }
 
 /**
  * Orchestrates Map-Reduce synthesis of concept articles.
- * Only processes summaries that have changed since the last compile,
- * and re-synthesizes only the concepts affected by those changes.
- *
- * @param client - Anthropic client instance
+ * Only processes changed summaries and affected concepts.
  */
-async function phaseSynthesize(client: Anthropic): Promise<void> {
+async function phaseSynthesize(): Promise<void> {
   const summaryFiles = fs
     .readdirSync(SUMMARIES_DIR)
     .filter((f) => f.endsWith(".md"))
@@ -554,8 +617,8 @@ async function phaseSynthesize(client: Anthropic): Promise<void> {
 
   const index = loadConceptIndex();
 
-  console.log("  Step 1/2: Mapping articles to concepts (Haiku)...");
-  const { changedStems, affectedConcepts } = await phaseMap(client, summaryFiles, index);
+  console.log("  Step 1/2: Mapping articles to concepts...");
+  const { changedStems, affectedConcepts } = await phaseMap(summaryFiles, index);
   saveConceptIndex(index);
 
   if (changedStems.length === 0) {
@@ -563,16 +626,14 @@ async function phaseSynthesize(client: Anthropic): Promise<void> {
     return;
   }
 
-  console.log(`  Step 2/2: Synthesizing ${affectedConcepts.size} affected concepts (Sonnet)...`);
-  await phaseReduce(client, affectedConcepts, index);
+  console.log(`  Step 2/2: Synthesizing ${affectedConcepts.size} affected concepts...`);
+  await phaseReduce(affectedConcepts, index);
 }
 
 /**
- * Generates index.md from all concept articles.
- *
- * @param client - Anthropic client instance
+ * Generates wiki/index.md from all concept articles.
  */
-async function phaseIndex(client: Anthropic): Promise<void> {
+async function phaseIndex(): Promise<void> {
   const conceptFiles = fs
     .readdirSync(CONCEPTS_DIR)
     .filter((f) => f.endsWith(".md") && f !== "_raw_response.md")
@@ -589,13 +650,8 @@ async function phaseIndex(client: Anthropic): Promise<void> {
     })
     .join("\n\n");
 
-  const response = await client.messages.create({
-    model: "claude-haiku-4-5-20251001",
-    max_tokens: 2048,
-    messages: [
-      {
-        role: "user",
-        content: `Create a master index for this knowledge base. Write everything in Ukrainian.
+  const result = await callClaude(
+    `Create a master index for this knowledge base. Write everything in Ukrainian.
 
 Concepts:
 ${conceptsOverview}
@@ -604,23 +660,18 @@ Return a well-structured index.md in Ukrainian with:
 1. A brief description of this knowledge base
 2. Table of contents grouped by theme
 3. Each concept links to its file: [Назва Концепту](concepts/filename.md)
-4. One-line description per concept`,
-      },
-    ],
-  });
+4. One-line description per concept`
+  );
 
-  fs.writeFileSync(INDEX_FILE, (response.content[0] as Anthropic.TextBlock).text, "utf-8");
+  fs.writeFileSync(INDEX_FILE, result, "utf-8");
   console.log(`  → index.md`);
 }
 
 /**
- * Enriches summaries by replacing plain concept names in "Ключові концепти"
- * with markdown links to the actual concept files.
- * Skips summaries that already contain links.
- *
- * @param client - Anthropic client instance
+ * Enriches summaries by replacing plain concept names with markdown links.
+ * Skips summaries that already contain links. Runs in parallel (up to 5 concurrent).
  */
-async function phaseEnrichSummaries(client: Anthropic): Promise<void> {
+async function phaseEnrichSummaries(): Promise<void> {
   const summaryFiles = fs
     .readdirSync(SUMMARIES_DIR)
     .filter((f) => f.endsWith(".md"))
@@ -638,24 +689,18 @@ async function phaseEnrichSummaries(client: Anthropic): Promise<void> {
 
   const conceptList = conceptStems.map((s) => `${s}.md`).join(", ");
 
-  for (const summaryPath of summaryFiles) {
+  await runConcurrent(summaryFiles, async (summaryPath) => {
     const content = fs.readFileSync(summaryPath, "utf-8");
 
-    // Skip if links already present
     if (content.includes("](../concepts/")) {
       console.log(`  skip (already linked): ${path.basename(summaryPath)}`);
-      continue;
+      return;
     }
 
     console.log(`  linking: ${path.basename(summaryPath)}`);
 
-    const response = await client.messages.create({
-      model: "claude-haiku-4-5-20251001",
-      max_tokens: 1024,
-      messages: [
-        {
-          role: "user",
-          content: `You have this summary file:
+    const result = await callClaude(
+      `You have this summary file:
 
 ${content}
 
@@ -663,17 +708,11 @@ Available concept files: ${conceptList}
 
 In the "## Ключові концепти" section, replace each plain concept name with a markdown link to the matching concept file using relative path "../concepts/filename.md".
 Only link concepts that have a clearly matching file. Keep the display text in Ukrainian as-is.
-Return the complete updated summary file content, nothing else.`,
-        },
-      ],
-    });
-
-    fs.writeFileSync(
-      summaryPath,
-      (response.content[0] as Anthropic.TextBlock).text,
-      "utf-8"
+Return the complete updated summary file content, nothing else.`
     );
-  }
+
+    fs.writeFileSync(summaryPath, result, "utf-8");
+  });
 }
 
 // ---------------------------------------------------------------------------
@@ -681,23 +720,15 @@ Return the complete updated summary file content, nothing else.`,
 // ---------------------------------------------------------------------------
 
 /**
- * Answers a question using the wiki as cached context.
+ * Answers a question using the wiki as context.
  *
  * @param question - The question to answer
  */
 async function cmdQuery(question: string): Promise<void> {
-  const apiKey = process.env.ANTHROPIC_API_KEY;
-  if (!apiKey) {
-    console.error("Error: ANTHROPIC_API_KEY must be set in .env");
-    process.exit(1);
-  }
-
   if (!fs.existsSync(INDEX_FILE)) {
     console.error("Wiki not built yet. Run: npm run compile");
     process.exit(1);
   }
-
-  const client = new Anthropic({ apiKey });
 
   const index = fs.readFileSync(INDEX_FILE, "utf-8");
   const conceptFiles = fs
@@ -715,28 +746,72 @@ async function cmdQuery(question: string): Promise<void> {
       })
       .join("\n\n---\n\n");
 
-  const response = await client.messages.create({
-    model: "claude-sonnet-4-6",
-    max_tokens: 2048,
-    messages: [
-      {
-        role: "user",
-        content: [
-          {
-            type: "text",
-            text: wikiContext,
-            cache_control: { type: "ephemeral" },
-          } as Anthropic.TextBlockParam & { cache_control: { type: "ephemeral" } },
-          {
-            type: "text",
-            text: `Based on the knowledge base above, answer in Ukrainian:\n\n${question}`,
-          },
-        ],
-      },
-    ],
-  });
+  const result = await callClaude(
+    `${wikiContext}
 
-  console.log((response.content[0] as Anthropic.TextBlock).text);
+---
+
+Based on the knowledge base above, answer in Ukrainian:
+
+${question}`
+  );
+
+  console.log(result);
+}
+
+// ---------------------------------------------------------------------------
+// linkedin command
+// ---------------------------------------------------------------------------
+
+/**
+ * Generates 10 creative, unexpected LinkedIn post ideas based on the wiki.
+ * Focuses on cross-concept combinations, contrarian takes, and novel angles.
+ */
+async function cmdLinkedIn(): Promise<void> {
+  if (!fs.existsSync(INDEX_FILE)) {
+    console.error("Wiki not built yet. Run: npm run compile");
+    process.exit(1);
+  }
+
+  const index = fs.readFileSync(INDEX_FILE, "utf-8");
+  const conceptFiles = fs
+    .readdirSync(CONCEPTS_DIR)
+    .filter((f) => f.endsWith(".md") && f !== "_raw_response.md")
+    .map((f) => path.join(CONCEPTS_DIR, f))
+    .sort();
+
+  const wikiContext =
+    `# Index\n\n${index}\n\n---\n\n` +
+    conceptFiles
+      .map((f) => {
+        const name = path.basename(f, ".md");
+        return `# ${name}\n\n${fs.readFileSync(f, "utf-8")}`;
+      })
+      .join("\n\n---\n\n");
+
+  const result = await callClaude(
+    `${wikiContext}
+
+---
+
+You are a creative LinkedIn content strategist. Based on this knowledge base, generate 10 LinkedIn post ideas.
+
+Rules:
+- Be UNEXPECTED — avoid obvious, generic takes
+- Cross-pollinate concepts from different domains in this wiki
+- Use contrarian angles, surprising analogies, "what nobody talks about" framings
+- Think: what connection between two topics would make someone stop scrolling?
+- Each idea must be distinct — no repetition of angles
+- Respond entirely in Ukrainian
+
+Format each idea as:
+**N. [Заголовок поста]**
+[2 речення: чому це несподівано і який кут зору відкриває пост]
+
+Generate 10 ideas:`
+  );
+
+  console.log(result);
 }
 
 // ---------------------------------------------------------------------------
@@ -759,6 +834,15 @@ async function main(): Promise<void> {
       await cmdAdd(url);
       break;
     }
+    case "paste": {
+      const title = args.join(" ");
+      if (!title) {
+        console.error('Usage: cat file.txt | npm run paste -- "Article Title"');
+        process.exit(1);
+      }
+      await cmdPaste(title);
+      break;
+    }
     case "compile":
       await cmdCompile();
       break;
@@ -771,13 +855,18 @@ async function main(): Promise<void> {
       await cmdQuery(question);
       break;
     }
+    case "linkedin":
+      await cmdLinkedIn();
+      break;
     default:
       console.log(`Wiki Builder
 
 Usage:
-  npm run add -- <notion-url>   Fetch a Notion page, save to raw/, compile
-  npm run compile               Process raw/*.md → wiki/
-  npm run query -- "question"   Ask a question against the wiki`);
+  npm run add -- <notion-url>              Fetch a Notion page, save to raw/, compile
+  cat file.txt | npm run paste -- "Title"  Process raw text, translate to Ukrainian, add to wiki
+  npm run compile                          Process raw/*.md → wiki/
+  npm run query -- "question"              Ask a question against the wiki
+  npm run linkedin                         Generate 10 LinkedIn post ideas from wiki`);
   }
 }
 

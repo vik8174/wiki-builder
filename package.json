@@ -4,14 +4,15 @@
   "description": "Transform articles into an organized knowledge base using Claude",
   "scripts": {
     "add": "tsx wiki-builder.ts add",
+    "paste": "tsx wiki-builder.ts paste",
     "compile": "tsx wiki-builder.ts compile",
-    "query": "tsx wiki-builder.ts query"
+    "query": "tsx wiki-builder.ts query",
+    "linkedin": "tsx wiki-builder.ts linkedin"
   },
   "keywords": [],
   "author": "",
   "license": "MIT",
   "dependencies": {
-    "@anthropic-ai/sdk": "0.89.0",
     "@notionhq/client": "5.18.0",
     "dotenv": "17.4.2",
     "tsx": "4.21.0"
