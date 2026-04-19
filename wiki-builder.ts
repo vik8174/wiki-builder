@@ -815,6 +815,68 @@ Generate 10 ideas:`
 }
 
 // ---------------------------------------------------------------------------
+// write command
+// ---------------------------------------------------------------------------
+
+/**
+ * Expands a post idea into a full, publish-ready LinkedIn post grounded in the wiki.
+ * Structure: hook → body → conclusion → CTA → hashtags.
+ *
+ * @param idea - Short description or title of the post idea
+ */
+async function cmdWrite(idea: string): Promise<void> {
+  if (!fs.existsSync(INDEX_FILE)) {
+    console.error("Wiki not built yet. Run: npm run compile");
+    process.exit(1);
+  }
+
+  const index = fs.readFileSync(INDEX_FILE, "utf-8");
+  const conceptFiles = fs
+    .readdirSync(CONCEPTS_DIR)
+    .filter((f) => f.endsWith(".md") && f !== "_raw_response.md")
+    .map((f) => path.join(CONCEPTS_DIR, f))
+    .sort();
+
+  const wikiContext =
+    `# Index\n\n${index}\n\n---\n\n` +
+    conceptFiles
+      .map((f) => {
+        const name = path.basename(f, ".md");
+        return `# ${name}\n\n${fs.readFileSync(f, "utf-8")}`;
+      })
+      .join("\n\n---\n\n");
+
+  const result = await callClaude(
+    `${wikiContext}
+
+---
+
+You are a senior developer writing on LinkedIn to build a personal brand.
+Use the knowledge base above as your source of expertise and concrete examples.
+
+Write a full LinkedIn post about this idea: "${idea}"
+
+Post structure:
+1. Hook (1-2 lines) — stops scrolling, provokes or surprises the reader
+2. Body (4-8 short paragraphs) — concrete examples from real practice, contrasts, insights
+3. Conclusion (1-2 lines) — summary or thought-provoking statement
+4. CTA (1 line) — question to the audience to spark comments
+5. Hashtags — 3-5 relevant tags
+
+Rules:
+- Write in first person as a developer sharing genuine experience
+- Be specific — no generic platitudes
+- No corporate or marketing tone
+- Write entirely in Ukrainian
+- Body length: 150-300 words
+
+Write the post:`
+  );
+
+  console.log(result);
+}
+
+// ---------------------------------------------------------------------------
 // CLI entry point
 // ---------------------------------------------------------------------------
 
@@ -858,6 +920,15 @@ async function main(): Promise<void> {
     case "linkedin":
       await cmdLinkedIn();
       break;
+    case "write": {
+      const idea = args.join(" ");
+      if (!idea) {
+        console.error('Usage: npm run write -- "your post idea"');
+        process.exit(1);
+      }
+      await cmdWrite(idea);
+      break;
+    }
     default:
       console.log(`Wiki Builder
 
@@ -866,7 +937,8 @@ Usage:
   cat file.txt | npm run paste -- "Title"  Process raw text, translate to Ukrainian, add to wiki
   npm run compile                          Process raw/*.md → wiki/
   npm run query -- "question"              Ask a question against the wiki
-  npm run linkedin                         Generate 10 LinkedIn post ideas from wiki`);
+  npm run linkedin                         Generate 10 LinkedIn post ideas from wiki
+  npm run write -- "idea"                  Expand an idea into a full LinkedIn post`);
   }
 }
 

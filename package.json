@@ -7,7 +7,8 @@
     "paste": "tsx wiki-builder.ts paste",
     "compile": "tsx wiki-builder.ts compile",
     "query": "tsx wiki-builder.ts query",
-    "linkedin": "tsx wiki-builder.ts linkedin"
+    "linkedin": "tsx wiki-builder.ts linkedin",
+    "write": "tsx wiki-builder.ts write"
   },
   "keywords": [],
   "author": "",
